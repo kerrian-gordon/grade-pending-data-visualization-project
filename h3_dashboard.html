@@ -23,47 +23,14 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     line-height: 1.5;
   }
-  header {
-    padding: 2rem 1.5rem 1rem;
-    max-width: 980px;
-    margin: 0 auto;
-  }
+  header { padding: 2rem 1.5rem 1rem; max-width: 980px; margin: 0 auto; }
   h1 { font-size: 22px; font-weight: 500; margin: 0 0 6px; }
   .sub { color: var(--text-secondary); font-size: 14px; margin: 0; }
-  .status {
-    max-width: 980px;
-    margin: 0 auto;
-    padding: 0 1.5rem;
-    font-size: 13px;
-    color: var(--text-muted);
-  }
-  #progress-bar-wrap {
-    height: 4px;
-    background: var(--border);
-    border-radius: 2px;
-    overflow: hidden;
-    margin: 8px 0 20px;
-    max-width: 980px;
-  }
-  #progress-bar {
-    height: 100%;
-    width: 0%;
-    background: var(--blue);
-    transition: width 0.2s;
-  }
-  main {
-    max-width: 980px;
-    margin: 0 auto;
-    padding: 0 1.5rem 3rem;
-    display: none;
-  }
-  section {
-    background: var(--surface);
-    border: 0.5px solid var(--border);
-    border-radius: 12px;
-    padding: 1.25rem 1.5rem 1.5rem;
-    margin-bottom: 1.5rem;
-  }
+  .status { max-width: 980px; margin: 0 auto; padding: 0 1.5rem; font-size: 13px; color: var(--text-muted); }
+  #progress-bar-wrap { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin: 8px 0 20px; max-width: 980px; }
+  #progress-bar { height: 100%; width: 0%; background: var(--blue); transition: width 0.2s; }
+  main { max-width: 980px; margin: 0 auto; padding: 0 1.5rem 3rem; display: none; }
+  section { background: var(--surface); border: 0.5px solid var(--border); border-radius: 12px; padding: 1.25rem 1.5rem 1.5rem; margin-bottom: 1.5rem; }
   h2 { font-size: 16px; font-weight: 500; margin: 0 0 4px; }
   p.desc { font-size: 13px; color: var(--text-secondary); margin: 0 0 1rem; max-width: 640px; }
   .chart-wrap { position: relative; width: 100%; }
@@ -73,6 +40,7 @@
   .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
   .pie-label { text-align: center; font-size: 13px; color: var(--text-secondary); margin-top: 6px; }
   footer { max-width: 980px; margin: 0 auto; padding: 0 1.5rem 3rem; font-size: 12px; color: var(--text-muted); }
+  code { background: var(--border); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
   @media (max-width: 700px) { .two-col { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -90,7 +58,7 @@
 
   <section>
     <h2>The gap holds within cuisine</h2>
-    <p class="desc">Average inspection score for chain vs. independent locations, restricted to cuisines with enough of both to compare. Lower is better.</p>
+    <p class="desc">Average inspection score for chain vs. independent locations, restricted to cuisines with enough of both to compare. Lower is better. Computed server-side — the API only returns the averages, not raw rows.</p>
     <div class="chart-wrap" style="height: 320px;">
       <canvas id="barChart" role="img" aria-label="Bar chart comparing average inspection score between chain and independent restaurants, by cuisine"></canvas>
     </div>
@@ -117,7 +85,7 @@
 
   <section>
     <h2>Chain size itself doesn't predict score</h2>
-    <p class="desc">Each point is one restaurant name. X-axis is how many NYC locations it has; Y-axis is its average inspection score. If bigger chains scored better, points would trend downward to the right.</p>
+    <p class="desc">Each point is one restaurant name with 5+ inspections on record. X-axis is how many NYC locations it has; Y-axis is its average score. Also computed server-side, one row per restaurant name rather than one row per inspection.</p>
     <div class="chart-wrap" style="height: 320px;">
       <canvas id="scatterChart" role="img" aria-label="Scatter plot of number of restaurant locations versus average inspection score"></canvas>
     </div>
@@ -125,7 +93,7 @@
 
   <section>
     <h2>Future chains already scored better before expanding</h2>
-    <p class="desc">Average score for restaurants that eventually became chains vs. restaurants that stayed independent, plotted relative to the month they crossed into chain status (or an equivalent reference point for independents). No jump at month zero means expansion itself isn't what changed the score.</p>
+    <p class="desc">Average score for restaurants that eventually became chains vs. restaurants that stayed independent, plotted relative to the month they crossed into chain status (or an equivalent reference point for independents). This is the one chart that needs individual inspection records rather than a server-side average, since it depends on exact dates.</p>
     <div class="chart-wrap" style="height: 320px;">
       <canvas id="lineChart" role="img" aria-label="Line chart of average inspection score over months relative to a restaurant becoming a chain, for future chains and independents"></canvas>
     </div>
@@ -146,32 +114,73 @@ const BASE_URL = "https://data.cityofnewyork.us/resource/43nn-pn8j.json";
 const PAGE_SIZE = 50000;
 const FLAGGED_CUISINES = ["Indian","Caribbean","Chinese","Middle Eastern","Turkish"];
 const CHAIN_CUISINES = ["Donuts","Hamburgers","Coffee/Tea"];
+const CUISINE_LIST = [...FLAGGED_CUISINES, ...CHAIN_CUISINES];
 
-async function fetchAll() {
+function authHeaders() {
+  return APP_TOKEN ? { "X-App-Token": APP_TOKEN } : {};
+}
+
+async function soqlGet(params) {
+  const url = BASE_URL + "?" + params.toString();
+  const resp = await fetch(url, { headers: authHeaders() });
+  if (!resp.ok) throw new Error("API request failed: " + resp.status + " " + (await resp.text()).slice(0,200));
+  return resp.json();
+}
+
+// ---- AGGREGATE QUERY 1: location count per restaurant name (server-side GROUP BY) ----
+async function fetchLocationCounts() {
+  const params = new URLSearchParams({
+    "$select": "dba, count(distinct camis) as locs",
+    "$where": "dba IS NOT NULL",
+    "$group": "dba",
+    "$limit": 50000
+  });
+  return soqlGet(params);
+}
+
+// ---- AGGREGATE QUERY 2: avg score + count per restaurant name, for the scatter plot ----
+async function fetchDbaScores() {
+  const params = new URLSearchParams({
+    "$select": "dba, avg(score) as avg_score, count(*) as n",
+    "$where": "score IS NOT NULL AND dba IS NOT NULL",
+    "$group": "dba",
+    "$having": "count(*) >= 5",
+    "$limit": 50000
+  });
+  return soqlGet(params);
+}
+
+// ---- AGGREGATE QUERY 3: avg score + count per (restaurant name, cuisine), filtered server-side to only the 8 cuisines we need ----
+async function fetchCuisineDbaScores() {
+  const cuisineList = CUISINE_LIST.map(c => "'" + c.replace(/'/g, "''") + "'").join(",");
+  const params = new URLSearchParams({
+    "$select": "dba, cuisine_description, avg(score) as avg_score, count(*) as n",
+    "$where": `score IS NOT NULL AND dba IS NOT NULL AND cuisine_description in(${cuisineList})`,
+    "$group": "dba, cuisine_description",
+    "$limit": 50000
+  });
+  return soqlGet(params);
+}
+
+// ---- RAW PAGINATED FETCH: only for the event-study line chart, which needs real per-record dates ----
+async function fetchRawForEventStudy(onProgress) {
   let all = [];
   let offset = 0;
-  const statusEl = document.getElementById('status');
-  const bar = document.getElementById('progress-bar');
   while (true) {
     const params = new URLSearchParams({
-      "$select": "camis,dba,cuisine_description,inspection_date,score",
+      "$select": "camis,dba,inspection_date,score",
+      "$where": "score IS NOT NULL AND inspection_date > '2018-01-01'",
       "$limit": PAGE_SIZE,
       "$offset": offset,
       "$order": ":id"
     });
-    const url = BASE_URL + "?" + params.toString();
-    const headers = APP_TOKEN ? { "X-App-Token": APP_TOKEN } : {};
-    const resp = await fetch(url, { headers });
-    if (!resp.ok) throw new Error("API request failed: " + resp.status);
-    const batch = await resp.json();
+    const batch = await soqlGet(params);
     if (batch.length === 0) break;
     all = all.concat(batch);
     offset += PAGE_SIZE;
-    statusEl.textContent = "Fetched " + all.length.toLocaleString() + " records so far\u2026";
-    bar.style.width = Math.min(95, (all.length / 300000) * 100) + "%";
+    onProgress(all.length);
     if (batch.length < PAGE_SIZE) break;
   }
-  bar.style.width = "100%";
   return all;
 }
 
@@ -181,126 +190,160 @@ function median(arr) {
   return s.length % 2 ? s[mid] : (s[mid-1]+s[mid])/2;
 }
 
-function buildAndRender(raw) {
-  const rows = raw
-    .filter(r => r.score !== undefined && r.inspection_date)
-    .map(r => ({
-      camis: r.camis,
-      dba: (r.dba || "").trim(),
-      cuisine: r.cuisine_description,
-      date: new Date(r.inspection_date),
-      score: parseFloat(r.score)
-    }))
-    .filter(r => !isNaN(r.score) && r.date.getFullYear() > 2000);
+async function main() {
+  const statusEl = document.getElementById('status');
+  const bar = document.getElementById('progress-bar');
 
-  // location count and first-seen date per camis
-  const camisFirst = new Map();
-  const camisDba = new Map();
-  for (const r of rows) {
-    camisDba.set(r.camis, r.dba);
-    if (!camisFirst.has(r.camis) || r.date < camisFirst.get(r.camis)) camisFirst.set(r.camis, r.date);
-  }
-  const dbaLocations = new Map(); // dba -> Set(camis)
-  for (const [camis, dba] of camisDba) {
-    if (!dbaLocations.has(dba)) dbaLocations.set(dba, new Set());
-    dbaLocations.get(dba).add(camis);
-  }
-  const chainNames = new Set();
-  const indepNames = new Set();
-  for (const [dba, camisSet] of dbaLocations) {
-    if (camisSet.size >= 5) chainNames.add(dba);
-    else if (camisSet.size === 1) indepNames.add(dba);
+  statusEl.textContent = "Fetching aggregated location counts\u2026";
+  bar.style.width = "10%";
+  const locRows = await fetchLocationCounts();
+  const dbaLocs = new Map();
+  for (const r of locRows) dbaLocs.set(r.dba, parseInt(r.locs, 10));
+  const chainNames = new Set([...dbaLocs].filter(([,n]) => n >= 5).map(([d]) => d));
+  const indepNames = new Set([...dbaLocs].filter(([,n]) => n === 1).map(([d]) => d));
+
+  statusEl.textContent = "Fetching per-restaurant average scores (scatter plot)\u2026";
+  bar.style.width = "30%";
+  const dbaScoreRows = await fetchDbaScores();
+
+  statusEl.textContent = "Fetching cuisine-level aggregates (bar + pie charts, 8 cuisines only)\u2026";
+  bar.style.width = "45%";
+  const cuisineDbaRows = await fetchCuisineDbaScores();
+
+  statusEl.textContent = "Fetching raw inspection records for the event-study timeline\u2026";
+  bar.style.width = "55%";
+  const rawRows = await fetchRawForEventStudy(count => {
+    statusEl.textContent = "Fetching raw inspection records for the event-study timeline\u2026 (" + count.toLocaleString() + " so far)";
+    bar.style.width = Math.min(95, 55 + (count/300000)*40) + "%";
+  });
+
+  bar.style.width = "100%";
+  document.getElementById('progress-bar-wrap').style.display = 'none';
+  document.getElementById('main').style.display = 'block';
+  render({ dbaLocs, chainNames, indepNames, dbaScoreRows, cuisineDbaRows, rawRows });
+}
+
+function showSectionError(canvasId, err) {
+  const canvas = document.getElementById(canvasId);
+  const wrap = canvas.closest('.chart-wrap');
+  wrap.innerHTML = '<p style="color:#a32d2d;font-size:13px;padding:1rem;background:#fcebeb;border-radius:8px;">Chart failed to build: ' + (err && err.message ? err.message : err) + '</p>';
+  console.error(canvasId, err);
+}
+
+function render({ dbaLocs, chainNames, indepNames, dbaScoreRows, cuisineDbaRows, rawRows }) {
+
+  // ---- BAR + PIE: build from the small, cuisine-filtered aggregate (cuisineDbaRows) ----
+  // A dba can appear more than once per cuisine if labeling varied historically; collapse by taking the entry with the largest n.
+  const bestPerDbaCuisine = new Map(); // dba -> {cuisine, avg_score, n}
+  for (const r of cuisineDbaRows) {
+    const n = parseInt(r.n, 10);
+    const existing = bestPerDbaCuisine.get(r.dba);
+    if (!existing || n > existing.n) {
+      bestPerDbaCuisine.set(r.dba, { cuisine: r.cuisine_description, avg_score: parseFloat(r.avg_score), n });
+    }
   }
 
-  // ---- BAR CHART: chain vs independent avg score by cuisine ----
-  const barCuisines = [...FLAGGED_CUISINES, ...CHAIN_CUISINES];
-  const barData = { chain: [], indep: [] };
+  try {
   const barLabels = [];
-  for (const c of barCuisines) {
-    const cRows = rows.filter(r => r.cuisine === c);
-    const chainScores = cRows.filter(r => chainNames.has(r.dba)).map(r => r.score);
-    const indepScores = cRows.filter(r => indepNames.has(r.dba)).map(r => r.score);
-    if (chainScores.length >= 20 && indepScores.length >= 20) {
-      barLabels.push(c);
-      barData.chain.push(+(chainScores.reduce((a,b)=>a+b,0)/chainScores.length).toFixed(1));
-      barData.indep.push(+(indepScores.reduce((a,b)=>a+b,0)/indepScores.length).toFixed(1));
+  const barChain = [];
+  const barIndep = [];
+  for (const cuisine of CUISINE_LIST) {
+    let chainSum = 0, chainN = 0, indepSum = 0, indepN = 0;
+    for (const [dba, v] of bestPerDbaCuisine) {
+      if (v.cuisine !== cuisine) continue;
+      if (chainNames.has(dba)) { chainSum += v.avg_score * v.n; chainN += v.n; }
+      else if (indepNames.has(dba)) { indepSum += v.avg_score * v.n; indepN += v.n; }
+    }
+    if (chainN >= 20 && indepN >= 20) {
+      barLabels.push(cuisine);
+      barChain.push(+(chainSum/chainN).toFixed(1));
+      barIndep.push(+(indepSum/indepN).toFixed(1));
     }
   }
   new Chart(document.getElementById('barChart'), {
     type: 'bar',
-    data: {
-      labels: barLabels,
-      datasets: [
-        { label: 'Independent', data: barData.indep, backgroundColor: '#eb6834', borderRadius: 4 },
-        { label: 'Chain', data: barData.chain, backgroundColor: '#2a78d6', borderRadius: 4 }
-      ]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
+    data: { labels: barLabels, datasets: [
+      { label: 'Independent', data: barIndep, backgroundColor: '#eb6834', borderRadius: 4 },
+      { label: 'Chain', data: barChain, backgroundColor: '#2a78d6', borderRadius: 4 }
+    ]},
+    options: { responsive: true, maintainAspectRatio: false,
       scales: { y: { title: { display: true, text: 'Avg score (lower = better)' } } },
-      plugins: { legend: { position: 'top' } }
-    }
+      plugins: { legend: { position: 'top' } } }
   });
 
-  // ---- PIE CHARTS: composition ----
   function compositionFor(cuisineList) {
-    const cRows = rows.filter(r => cuisineList.includes(r.cuisine));
-    const chainCount = cRows.filter(r => chainNames.has(r.dba)).length;
-    const indepCount = cRows.filter(r => indepNames.has(r.dba)).length;
-    const otherCount = cRows.length - chainCount - indepCount;
-    return [chainCount, indepCount, otherCount];
+    let chainN = 0, indepN = 0, otherN = 0;
+    for (const [dba, v] of bestPerDbaCuisine) {
+      if (!cuisineList.includes(v.cuisine)) continue;
+      if (chainNames.has(dba)) chainN += v.n;
+      else if (indepNames.has(dba)) indepN += v.n;
+      else otherN += v.n;
+    }
+    return [chainN, indepN, otherN];
   }
-  const worstComp = compositionFor(FLAGGED_CUISINES);
-  const bestComp = compositionFor(CHAIN_CUISINES);
-  const pieOpts = {
-    responsive: true, maintainAspectRatio: false,
-    plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 } } } }
-  };
+  const pieOpts = { responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 } } } } };
   new Chart(document.getElementById('pieWorst'), {
     type: 'pie',
-    data: { labels: ['Chain','Independent','Other (2-4 locations)'], datasets: [{ data: worstComp, backgroundColor: ['#2a78d6','#eb6834','#c3c2b7'] }] },
+    data: { labels: ['Chain','Independent','Other (2-4 locations)'], datasets: [{ data: compositionFor(FLAGGED_CUISINES), backgroundColor: ['#2a78d6','#eb6834','#c3c2b7'] }] },
     options: pieOpts
   });
   new Chart(document.getElementById('pieBest'), {
     type: 'pie',
-    data: { labels: ['Chain','Independent','Other (2-4 locations)'], datasets: [{ data: bestComp, backgroundColor: ['#2a78d6','#eb6834','#c3c2b7'] }] },
+    data: { labels: ['Chain','Independent','Other (2-4 locations)'], datasets: [{ data: compositionFor(CHAIN_CUISINES), backgroundColor: ['#2a78d6','#eb6834','#c3c2b7'] }] },
     options: pieOpts
   });
+  } catch (err) {
+    showSectionError('barChart', err);
+    showSectionError('pieWorst', err);
+    showSectionError('pieBest', err);
+  }
 
-  // ---- SCATTER: locations vs avg score, per dba ----
+  // ---- SCATTER: from the small per-dba aggregate (dbaScoreRows), joined to location counts ----
+  try {
   const scatterPoints = [];
-  for (const [dba, camisSet] of dbaLocations) {
-    const dRows = rows.filter(r => r.dba === dba);
-    if (dRows.length < 5) continue;
-    const avg = dRows.reduce((a,r)=>a+r.score,0) / dRows.length;
-    scatterPoints.push({ x: camisSet.size, y: +avg.toFixed(1) });
+  for (const r of dbaScoreRows) {
+    const locs = dbaLocs.get(r.dba);
+    if (!locs) continue;
+    scatterPoints.push({ x: locs, y: +parseFloat(r.avg_score).toFixed(1) });
   }
   new Chart(document.getElementById('scatterChart'), {
     type: 'scatter',
     data: { datasets: [{ label: 'Restaurant name', data: scatterPoints, backgroundColor: 'rgba(42,120,214,0.35)', pointRadius: 3 }] },
-    options: {
-      responsive: true, maintainAspectRatio: false,
+    options: { responsive: true, maintainAspectRatio: false,
       scales: {
         x: { type: 'logarithmic', title: { display: true, text: 'Number of NYC locations (log scale)' } },
         y: { title: { display: true, text: 'Avg score (lower = better)' } }
       },
-      plugins: { legend: { display: false } }
-    }
+      plugins: { legend: { display: false } } }
   });
+  } catch (err) {
+    showSectionError('scatterChart', err);
+  }
 
-  // ---- LINE CHART: event study ----
-  // Treatment: dba names that reached >=5 locations. Event date = 5th location's first-seen date.
+  // ---- LINE: event study, built from the raw rows (the one chart that needs them) ----
+  try {
+  const rows = rawRows.map(r => ({ camis: r.camis, dba: (r.dba||"").trim(), date: new Date(r.inspection_date), score: parseFloat(r.score) }))
+    .filter(r => !isNaN(r.score));
+
+  const camisFirst = new Map();
+  for (const r of rows) {
+    if (!camisFirst.has(r.camis) || r.date < camisFirst.get(r.camis)) camisFirst.set(r.camis, r.date);
+  }
+  const dbaCamisSet = new Map();
+  for (const r of rows) {
+    if (!dbaCamisSet.has(r.dba)) dbaCamisSet.set(r.dba, new Set());
+    dbaCamisSet.get(r.dba).add(r.camis);
+  }
+
   const treatEventDate = new Map();
   const firstEverDate = new Map();
-  for (const [dba, camisSet] of dbaLocations) {
+  for (const [dba, camisSet] of dbaCamisSet) {
     const dates = [...camisSet].map(c => camisFirst.get(c)).sort((a,b)=>a-b);
     firstEverDate.set(dba, dates[0]);
     if (dates.length >= 5) treatEventDate.set(dba, dates[4]);
   }
-  const tenureDays = [];
-  for (const [dba, eventDate] of treatEventDate) {
-    tenureDays.push((eventDate - firstEverDate.get(dba)) / 86400000);
-  }
+  const tenureDays = [...treatEventDate].map(([dba, ed]) => (ed - firstEverDate.get(dba)) / 86400000);
   const medianTenureDays = median(tenureDays);
 
   function binByMonths(getEventDate, nameFilter) {
@@ -315,18 +358,14 @@ function buildAndRender(raw) {
       bins[monthsRel].sum += r.score;
       bins[monthsRel].n += 1;
     }
-    return Object.entries(bins)
-      .map(([x, v]) => ({ x: +x, y: +(v.sum / v.n).toFixed(2) }))
-      .sort((a,b)=>a.x-b.x);
+    return Object.entries(bins).map(([x, v]) => ({ x: +x, y: +(v.sum / v.n).toFixed(2) })).sort((a,b)=>a.x-b.x);
   }
 
+  const indepNamesLocal = new Set([...dbaCamisSet].filter(([,s]) => s.size === 1).map(([d]) => d));
   const treatSeries = binByMonths(dba => treatEventDate.get(dba), dba => treatEventDate.has(dba));
   const controlSeries = binByMonths(
-    dba => {
-      const fd = firstEverDate.get(dba);
-      return fd ? new Date(fd.getTime() + medianTenureDays * 86400000) : null;
-    },
-    dba => indepNames.has(dba)
+    dba => { const fd = firstEverDate.get(dba); return fd ? new Date(fd.getTime() + medianTenureDays * 86400000) : null; },
+    dba => indepNamesLocal.has(dba)
   );
 
   const verticalLinePlugin = {
@@ -348,36 +387,29 @@ function buildAndRender(raw) {
   };
   new Chart(document.getElementById('lineChart'), {
     type: 'line',
-    data: {
-      datasets: [
-        { label: 'Future chains', data: treatSeries, borderColor: '#2a78d6', backgroundColor: '#2a78d6', borderWidth: 2, pointRadius: 3, tension: 0.2 },
-        { label: 'All independents', data: controlSeries, borderColor: '#eb6834', backgroundColor: '#eb6834', borderWidth: 2, borderDash: [6,4], pointRadius: 3, tension: 0.2 }
-      ]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      scales: {
-        x: { type: 'linear', title: { display: true, text: 'Months relative to event' } },
-        y: { title: { display: true, text: 'Avg score (lower = better)' } }
-      },
-      plugins: { legend: { display: false } }
-    },
+    data: { datasets: [
+      { label: 'Future chains', data: treatSeries, borderColor: '#2a78d6', backgroundColor: '#2a78d6', borderWidth: 2, pointRadius: 3, tension: 0.2 },
+      { label: 'All independents', data: controlSeries, borderColor: '#eb6834', backgroundColor: '#eb6834', borderWidth: 2, borderDash: [6,4], pointRadius: 3, tension: 0.2 }
+    ]},
+    options: { responsive: true, maintainAspectRatio: false,
+      scales: { x: { type: 'linear', title: { display: true, text: 'Months relative to event' } }, y: { title: { display: true, text: 'Avg score (lower = better)' } } },
+      plugins: { legend: { display: false } } },
     plugins: [verticalLinePlugin]
   });
 
-  document.getElementById('status').textContent = "Loaded " + rows.length.toLocaleString() + " inspection records, live from data.cityofnewyork.us";
-  document.getElementById('progress-bar-wrap').style.display = 'none';
-  document.getElementById('main').style.display = 'block';
+  document.getElementById('status').textContent = "Loaded live from data.cityofnewyork.us \u2014 " + rows.length.toLocaleString() + " raw records for the timeline, plus server-side aggregates for the other three charts";
+  } catch (err) {
+    showSectionError('lineChart', err);
+    document.getElementById('status').textContent = "Loaded, but the timeline chart hit an error \u2014 see the message above it.";
+  }
   const footer = document.getElementById('footer');
-  footer.textContent = "Data: NYC Open Data, DOHMH Restaurant Inspection Results (43nn-pn8j). Fetched live on page load. Chain = 5+ NYC locations under the same name; independent = exactly 1.";
+  footer.innerHTML = "Data: NYC Open Data, DOHMH Restaurant Inspection Results (43nn-pn8j). Bar, pie, and scatter charts use server-side <code>$group</code>/<code>$where</code> aggregate queries \u2014 no raw rows transferred for those three. The line chart still needs raw per-record dates. Chain = 5+ NYC locations under the same name; independent = exactly 1.";
   footer.style.display = 'block';
 }
 
-fetchAll()
-  .then(buildAndRender)
-  .catch(err => {
-    document.getElementById('status').textContent = "Couldn't load live data: " + err.message + ". The API may be rate-limiting this browser — try adding your own app token at the top of the script.";
-  });
+main().catch(err => {
+  document.getElementById('status').textContent = "Couldn't load live data: " + err.message;
+});
 </script>
 
 </body>
