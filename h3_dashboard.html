@@ -162,26 +162,53 @@ async function fetchCuisineDbaScores() {
   return soqlGet(params);
 }
 
-// ---- RAW PAGINATED FETCH: only for the event-study line chart, which needs real per-record dates ----
+// ---- RAW PAGINATED FETCH: only for the event-study line chart, which needs real per-record dates.
+// Stores data as flat numeric arrays (dba names coded to small integers) instead of an array of
+// JS objects, since 290,000+ objects with repeated string keys is what crashed the tab before. ----
 async function fetchRawForEventStudy(onProgress) {
-  let all = [];
+  const dbaToId = new Map();
+  const dbaNames = [];
+  const camisIds = [];      // parallel arrays, one entry per inspection row
+  const dbaIds = [];
+  const dateNums = [];      // days since epoch, integer
+  const scores = [];
+
+  function idFor(name) {
+    let id = dbaToId.get(name);
+    if (id === undefined) {
+      id = dbaNames.length;
+      dbaNames.push(name);
+      dbaToId.set(name, id);
+    }
+    return id;
+  }
+
   let offset = 0;
+  let total = 0;
   while (true) {
     const params = new URLSearchParams({
       "$select": "camis,dba,inspection_date,score",
-      "$where": "score IS NOT NULL AND inspection_date > '2018-01-01'",
+      "$where": "score IS NOT NULL AND inspection_date > '2000-01-01'",
       "$limit": PAGE_SIZE,
       "$offset": offset,
       "$order": ":id"
     });
     const batch = await soqlGet(params);
     if (batch.length === 0) break;
-    all = all.concat(batch);
+    for (const r of batch) {
+      const dba = (r.dba || "").trim();
+      if (!dba) continue;
+      camisIds.push(r.camis);
+      dbaIds.push(idFor(dba));
+      dateNums.push(Math.floor(new Date(r.inspection_date).getTime() / 86400000));
+      scores.push(parseFloat(r.score));
+    }
+    total += batch.length;
     offset += PAGE_SIZE;
-    onProgress(all.length);
+    onProgress(total);
     if (batch.length < PAGE_SIZE) break;
   }
-  return all;
+  return { dbaNames, camisIds, dbaIds, dateNums: Float64Array.from(dateNums), scores: Float64Array.from(scores) };
 }
 
 function median(arr) {
@@ -323,49 +350,56 @@ function render({ dbaLocs, chainNames, indepNames, dbaScoreRows, cuisineDbaRows,
 
   // ---- LINE: event study, built from the raw rows (the one chart that needs them) ----
   try {
-  const rows = rawRows.map(r => ({ camis: r.camis, dba: (r.dba||"").trim(), date: new Date(r.inspection_date), score: parseFloat(r.score) }))
-    .filter(r => !isNaN(r.score));
+  const { dbaNames, camisIds, dbaIds, dateNums, scores } = rawRows;
+  const n = dateNums.length;
 
+  // first-seen day-number per camis
   const camisFirst = new Map();
-  for (const r of rows) {
-    if (!camisFirst.has(r.camis) || r.date < camisFirst.get(r.camis)) camisFirst.set(r.camis, r.date);
+  for (let i = 0; i < n; i++) {
+    const c = camisIds[i], d = dateNums[i];
+    const cur = camisFirst.get(c);
+    if (cur === undefined || d < cur) camisFirst.set(c, d);
   }
-  const dbaCamisSet = new Map();
-  for (const r of rows) {
-    if (!dbaCamisSet.has(r.dba)) dbaCamisSet.set(r.dba, new Set());
-    dbaCamisSet.get(r.dba).add(r.camis);
+  // distinct camis set per dba-id
+  const dbaCamisSet = new Map(); // dbaId -> Set(camis)
+  for (let i = 0; i < n; i++) {
+    const dId = dbaIds[i], c = camisIds[i];
+    let s = dbaCamisSet.get(dId);
+    if (!s) { s = new Set(); dbaCamisSet.set(dId, s); }
+    s.add(c);
   }
 
-  const treatEventDate = new Map();
-  const firstEverDate = new Map();
-  for (const [dba, camisSet] of dbaCamisSet) {
-    const dates = [...camisSet].map(c => camisFirst.get(c)).sort((a,b)=>a-b);
-    firstEverDate.set(dba, dates[0]);
-    if (dates.length >= 5) treatEventDate.set(dba, dates[4]);
+  const treatEventDay = new Map(); // dbaId -> day-number of 5th location's first appearance
+  const firstEverDay = new Map();  // dbaId -> earliest day-number across all its locations
+  for (const [dId, camisSet] of dbaCamisSet) {
+    const days = [...camisSet].map(c => camisFirst.get(c)).sort((a,b)=>a-b);
+    firstEverDay.set(dId, days[0]);
+    if (days.length >= 5) treatEventDay.set(dId, days[4]);
   }
-  const tenureDays = [...treatEventDate].map(([dba, ed]) => (ed - firstEverDate.get(dba)) / 86400000);
-  const medianTenureDays = median(tenureDays);
+  const tenureDaysArr = [...treatEventDay].map(([dId, ed]) => ed - firstEverDay.get(dId));
+  const medianTenureDays = median(tenureDaysArr);
+  const indepIds = new Set([...dbaCamisSet].filter(([,s]) => s.size === 1).map(([d]) => d));
 
-  function binByMonths(getEventDate, nameFilter) {
+  function binByMonths(getEventDay, idFilter) {
     const bins = {};
-    for (const r of rows) {
-      if (!nameFilter(r.dba)) continue;
-      const eventDate = getEventDate(r.dba);
-      if (!eventDate) continue;
-      const monthsRel = Math.round((r.date - eventDate) / 86400000 / 30.44 / 6) * 6;
+    for (let i = 0; i < n; i++) {
+      const dId = dbaIds[i];
+      if (!idFilter(dId)) continue;
+      const eventDay = getEventDay(dId);
+      if (eventDay === undefined || eventDay === null) continue;
+      const monthsRel = Math.round((dateNums[i] - eventDay) / 30.44 / 6) * 6;
       if (monthsRel < -24 || monthsRel > 18) continue;
-      if (!bins[monthsRel]) bins[monthsRel] = { sum: 0, n: 0 };
-      bins[monthsRel].sum += r.score;
-      bins[monthsRel].n += 1;
+      if (!bins[monthsRel]) bins[monthsRel] = { sum: 0, cnt: 0 };
+      bins[monthsRel].sum += scores[i];
+      bins[monthsRel].cnt += 1;
     }
-    return Object.entries(bins).map(([x, v]) => ({ x: +x, y: +(v.sum / v.n).toFixed(2) })).sort((a,b)=>a.x-b.x);
+    return Object.entries(bins).map(([x, v]) => ({ x: +x, y: +(v.sum / v.cnt).toFixed(2) })).sort((a,b)=>a.x-b.x);
   }
 
-  const indepNamesLocal = new Set([...dbaCamisSet].filter(([,s]) => s.size === 1).map(([d]) => d));
-  const treatSeries = binByMonths(dba => treatEventDate.get(dba), dba => treatEventDate.has(dba));
+  const treatSeries = binByMonths(dId => treatEventDay.get(dId), dId => treatEventDay.has(dId));
   const controlSeries = binByMonths(
-    dba => { const fd = firstEverDate.get(dba); return fd ? new Date(fd.getTime() + medianTenureDays * 86400000) : null; },
-    dba => indepNamesLocal.has(dba)
+    dId => { const fd = firstEverDay.get(dId); return fd !== undefined ? fd + medianTenureDays : null; },
+    dId => indepIds.has(dId)
   );
 
   const verticalLinePlugin = {
@@ -397,7 +431,7 @@ function render({ dbaLocs, chainNames, indepNames, dbaScoreRows, cuisineDbaRows,
     plugins: [verticalLinePlugin]
   });
 
-  document.getElementById('status').textContent = "Loaded live from data.cityofnewyork.us \u2014 " + rows.length.toLocaleString() + " raw records for the timeline, plus server-side aggregates for the other three charts";
+  document.getElementById('status').textContent = "Loaded live from data.cityofnewyork.us \u2014 " + n.toLocaleString() + " raw records for the timeline, plus server-side aggregates for the other three charts";
   } catch (err) {
     showSectionError('lineChart', err);
     document.getElementById('status').textContent = "Loaded, but the timeline chart hit an error \u2014 see the message above it.";
